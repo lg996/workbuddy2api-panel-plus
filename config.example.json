@@ -60,6 +60,14 @@
     "mode": "passthrough",
     "file": ""
   },
+  "anthropic": {
+    "default_model": "",
+    "model_map": {}
+  },
+  "codex": {
+    "default_model": "",
+    "model_map": {}
+  },
   "upstash": {
     "url": "",
     "token": ""

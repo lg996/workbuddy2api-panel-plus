@@ -345,6 +345,9 @@ type requestTrace struct {
 	id    string
 	start time.Time
 	stat  *chatStat
+	// path 记录请求实际命中的路由（OpenAI chat / Anthropic messages / count_tokens），
+	// 供归档事件按真实路径落账，而不是把每条请求都记成 /v1/chat/completions。
+	path string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -397,10 +400,14 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
+	path := t.path
+	if path == "" {
+		path = "/v1/chat/completions"
+	}
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)

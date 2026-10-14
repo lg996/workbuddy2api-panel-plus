@@ -48,6 +48,21 @@ func TestPanelPackageDetailLimit(t *testing.T) {
 	}
 }
 
+func TestCodexConfigParsed(t *testing.T) {
+	c, err := ParseConfig([]byte(`{
+		"codex":{
+			"default_model":"glm-5.2",
+			"model_map":{"gpt-5-codex":"cn:deepseek-v4"}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if c.Codex.DefaultModel != "glm-5.2" || c.Codex.ModelMap["gpt-5-codex"] != "cn:deepseek-v4" {
+		t.Fatalf("codex config=%+v", c.Codex)
+	}
+}
+
 func TestLoggingDefaults(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {

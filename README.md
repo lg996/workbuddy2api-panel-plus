@@ -344,6 +344,25 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+# 原生 Anthropic Messages（Claude Code / Anthropic SDK；模型名需先经 anthropic.model_map 映射）
+curl -sN http://localhost:7863/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic 令牌计数（本地粗估，不打上游）
+curl -s http://localhost:7863/v1/messages/count_tokens \
+  -H "x-api-key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}'
+
+# 原生 Responses API（Codex；模型名可经 codex.model_map / codex.default_model 映射）
+curl -sN http://localhost:7863/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-5-codex","input":"hi","stream":true}'
 ```
 
 ## 配置说明
@@ -383,6 +402,10 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
+| `anthropic.default_model` | 空 | `/v1/messages` 的模型兜底：客户端发 `claude-*` 且未命中 `model_map` 时出站改写为该模型名（可带 `cn:`/`global:` 前缀）。**空 = 不做隐式映射**：`claude-*` 直接 400 并提示配置，避免把请求悄悄打到错误模型 |
+| `anthropic.model_map` | `{}` | `/v1/messages` 的显式模型映射：`{"客户端模型名":"网关模型名"}`，值可带 realm 前缀；命中优先于 `default_model`。非 `claude*` 名称无需配置，原样透传 |
+| `codex.default_model` | 空 | `/v1/responses` 的模型兜底：客户端模型名未命中 `model_map` 时出站改写为该模型名（可带 `cn:`/`global:` 前缀）。**空 = 原样透传**（与 Anthropic 的强制映射策略不同，见「Responses API（Codex）端点」） |
+| `codex.model_map` | `{}` | `/v1/responses` 的显式模型映射：`{"客户端模型名":"网关模型名"}`，值可带 realm 前缀；命中优先于 `default_model`。未命中且 `default_model` 为空时原样透传 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
@@ -688,11 +711,14 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/messages` | Bearer 或 `x-api-key`（`api_key` 非空时） | **原生 Anthropic Messages**（Claude Code / Anthropic SDK）；流式/非流式；协议翻译层复用 chat 全链路（选号/轮转/冷却/粘性/统计）。`claude-*` 模型名需经 `anthropic.model_map` / `anthropic.default_model` 映射（见「Anthropic Messages 端点」） |
+| `POST /v1/messages/count_tokens` | Bearer 或 `x-api-key`（`api_key` 非空时） | Anthropic 令牌计数端点；本地按字符数粗估（`input_tokens`），**不发起上游调用** |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | **OpenAI Responses API**（Codex）；流式/非流式；协议翻译层复用 chat 全链路（选号/轮转/冷却/粘性/统计）。模型名经 `codex.model_map` / `codex.default_model` 映射，未映射原样透传（见「Responses API（Codex）端点」） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
-> 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+> 鉴权规则：仅当 `api_key` 非空才校验密钥；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。`/v1/chat/completions`、`/v1/responses` 与 `/v1/models`、`/status` 走 `Authorization: Bearer <api_key>`；`/v1/messages`、`/v1/messages/count_tokens` 额外接受 Anthropic 原生 `x-api-key: <api_key>`（Anthropic SDK / Claude Code 默认头），两种形态任一命中即放行。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
@@ -710,6 +736,74 @@ http://127.0.0.1:7863/panel/
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`
 - 非流式请求由本地聚合完整 SSE 流为单 `chat.completion` 响应（含 `reasoning_content` / `tool_calls`）
 - 正文里的原生工具调用标记在透传前还原为 `delta.tool_calls`（见「原生工具调用标记还原」）：命中时一帧会拆成「正文帧 + N 个调用帧 + 收尾帧」，上游的 `finish_reason: stop` 改写为 `tool_calls` 且排在调用帧之后；未命中时逐字节透传
+
+### Anthropic Messages 端点
+
+`POST /v1/messages`（原生 Anthropic Messages，Claude Code / Anthropic SDK）与 `POST /v1/messages/count_tokens` 是**协议翻译层**：请求体先翻译成网关既有的 OpenAI Chat Completions 请求，复用同一条选号 / 轮转 / 冷却 / 熔断 / 会话粘性 / 在途租约 / 统计 / 成本记账管线，响应再翻译回 Anthropic 协议。**没有第二条调度管线**，所以 Anthropic 流量与 OpenAI 流量共享同一套容错与治理语义。
+
+模型映射：`claude-*` 模型名不能直接当上游模型用，需要显式配置（`anthropic.model_map` 优先，其次 `anthropic.default_model`；都没有则回 400 并在 message 里提示配置）。非 `claude*` 名称原样透传，可直接写网关模型名。
+
+请求/响应翻译口径：
+
+| 方向 | Anthropic | OpenAI（网关内部） |
+|---|---|---|
+| 请求 | `system`（字符串或 text block 数组） | 首条 `role=system` 消息 |
+| 请求 | `messages[].content` 字符串 | 同 role 的字符串 content |
+| 请求 | `image` block（base64 / url） | `image_url` part（base64 拼 data URL） |
+| 请求 | user 消息里的 `tool_result` block | 独立 `role=tool` 消息（`tool_call_id`） |
+| 请求 | assistant 消息里的 `tool_use` block | `tool_calls`（`input` 序列化为 `arguments`） |
+| 请求 | `tools[].input_schema` | `tools[].function.parameters` |
+| 请求 | `tool_choice`：`auto`/`any`/`none`/`{type:tool,name}` | `auto`/`required`/`none`/指定函数 |
+| 请求 | `stop_sequences` / `max_tokens` / `temperature` / `top_p` | `stop` / `max_tokens` / `temperature` / `top_p` |
+| 响应 | `content[].text` | `choices[0].message.content` |
+| 响应 | `content[].tool_use`（`input` 为对象） | `choices[0].message.tool_calls`（`arguments` JSON 解析回对象） |
+| 响应 | `stop_reason`：`end_turn`/`max_tokens`/`tool_use` | `finish_reason`：`stop`/`length`/`tool_calls` |
+| 响应 | `usage.input_tokens` / `output_tokens` | `usage.prompt_tokens` / `completion_tokens` |
+
+流式事件序列（OpenAI SSE → Anthropic SSE）：`message_start` → 每个内容块 `content_block_start` / `content_block_delta`（文本 `text_delta`、工具参数 `input_json_delta`）/ `content_block_stop` → `message_delta`（`stop_reason` + `output_tokens`）→ `message_stop`；上游 `error` 帧翻译成 Anthropic `error` 事件。
+
+已知边界：
+
+- `count_tokens` 为**本地粗估**（按字符数 / 4），不请求上游；Claude Code 用它做上下文预算，精确值非必需。
+- `top_k`、`thinking`（扩展思考块）、`metadata` 等字段被忽略；`thinking` 内容不会以 Anthropic thinking block 形式回传。
+- 流式 `message_start` 的 `input_tokens` 固定为 0（上游 usage 通常只在末帧给出），`output_tokens` 在 `message_delta` 补齐。
+- 上游错误按状态码映射到 Anthropic `error.type`（401 `authentication_error` / 403 `permission_error` / 429 `rate_limit_error` / 400 `invalid_request_error` / 503/502 `overloaded_error` / 其余 `api_error`）。
+
+### Responses API（Codex）端点
+
+`POST /v1/responses`（OpenAI Responses API，Codex）同样是**协议翻译层**：请求体先翻译成网关既有的 OpenAI Chat Completions 请求，复用同一条选号 / 轮转 / 冷却 / 熔断 / 会话粘性 / 在途租约 / 统计 / 成本记账管线，响应（非流式 JSON 或 SSE）再翻译回 Responses 协议。**没有第二条调度管线**，Codex 流量与 OpenAI / Anthropic 流量共享同一套容错与治理语义。
+
+鉴权：与 OpenAI 入口一致，走 `Authorization: Bearer <api_key>`（Codex CLI 默认头）。
+
+模型映射（`mapCodexModel`）：`codex.model_map[客户端模型名]` 命中优先（值可带 `cn:`/`global:` realm 前缀）；否则 `codex.default_model` 非空时兜底；都没有则**原样透传**——与 Anthropic 的强制映射策略不同，因为网关模型目录里就有 `gpt-*` 真实模型，前缀判定会误伤，未映射名交给上游报错更可靠。
+
+请求/响应翻译口径：
+
+| 方向 | Responses | OpenAI（网关内部） |
+|---|---|---|
+| 请求 | `instructions`（字符串） | 首条 `role=system` 消息 |
+| 请求 | `input` 字符串简写 | 一条 `role=user` 消息 |
+| 请求 | `input[]` 的 `message` item（`content` 字符串或 part 数组） | 同 role 消息；`input_text`/`output_text` → `text` part，`input_image` → `image_url` part |
+| 请求 | `input[]` 的 `function_call` item | 归并进 `assistant.tool_calls`（连续多条合一条） |
+| 请求 | `input[]` 的 `function_call_output` item | `role=tool` 消息（`tool_call_id` 取 `call_id`） |
+| 请求 | `input[]` 的 `reasoning` item | 忽略（上游无等价结构） |
+| 请求 | `tools[]`（扁平 `name`/`parameters`） | `tools[].function`（非 `function` 类型跳过） |
+| 请求 | `tool_choice`：`auto`/`none`/`required`/`{type:function,name}` | `auto`/`none`/`required`/指定函数 |
+| 请求 | `max_output_tokens` / `temperature` / `top_p` / `parallel_tool_calls` | `max_tokens` / `temperature` / `top_p` / `parallel_tool_calls` |
+| 请求 | `reasoning.effort` | `reasoning_effort` |
+| 请求 | `prompt_cache_key` | 同名透传（`session.ExtractKey` 认它做会话粘性键） |
+| 响应 | `output[].type=message` 的 `output_text` | `choices[0].message.content` |
+| 响应 | `output[].type=function_call`（`call_id`/`name`/`arguments`） | `choices[0].message.tool_calls` |
+| 响应 | `usage.input_tokens` / `output_tokens` | `usage.prompt_tokens` / `completion_tokens` |
+
+流式事件序列（OpenAI SSE → Responses SSE）：`response.created` → `response.in_progress` → 文本 `response.output_item.added` / `response.content_part.added` → `response.output_text.delta` ... → `response.output_text.done` / `response.content_part.done` / `response.output_item.done`；工具 `response.output_item.added`(function_call) → `response.function_call_arguments.delta` ... → `response.function_call_arguments.done` / `response.output_item.done` → `response.completed`（带完整 `output` + `usage`）。`sequence_number` 从 0 递增；上游 `error` 帧翻译成 `response.failed`；OpenAI 的 `data: [DONE]` 不外泄。
+
+已知边界：
+
+- 非 `function` 类型工具（`web_search` / `local_shell` 等内建工具）跳过——上游没有对应能力。
+- `store` / `include` / `text` / `metadata` / `previous_response_id` / `truncation` 等字段被忽略；`previous_response_id` 不回放历史，多轮上下文需由客户端在 `input` 里带全。
+- 未映射模型名原样透传（设计选择，见上）；需要强制某模型时配 `codex.default_model`。
+- 上游错误按状态码映射到 Responses `error.type`（401 `authentication_error` / 403 `permission_error` / 404 `not_found_error` / 429 `rate_limit_error` / 400/413 `invalid_request_error` / 503/502 `server_error`）。
 
 ### 上游端点
 

@@ -310,6 +310,12 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// Anthropic Messages 端点模型映射（/v1/messages）。
+		AnthropicDefaultModel: cfg.Anthropic.DefaultModel,
+		AnthropicModelMap:     cfg.Anthropic.ModelMap,
+		// Responses API（Codex）端点模型映射（/v1/responses）。
+		CodexDefaultModel: cfg.Codex.DefaultModel,
+		CodexModelMap:     cfg.Codex.ModelMap,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

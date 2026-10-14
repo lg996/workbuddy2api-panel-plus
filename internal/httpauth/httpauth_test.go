@@ -59,3 +59,68 @@ func TestDigestIsFixedLength(t *testing.T) {
 		t.Errorf("sha256 digest length = %d, want 32", len(digest("x")))
 	}
 }
+
+// reqAPIKey 构造一个只带 x-api-key 头的请求（Anthropic 原生 SDK / Claude Code 口径）。
+func reqAPIKey(key string) *http.Request {
+	r := httptest.NewRequest("GET", "/", nil)
+	if key != "" {
+		r.Header.Set("x-api-key", key)
+	}
+	return r
+}
+
+// TestVerifyAPIKey 覆盖 x-api-key 头的常量时间校验：空 key 放行、命中放行、
+// 缺头/错值拒绝（含前缀相等但长度不同的边界）。
+func TestVerifyAPIKey(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		hdr  string
+		want bool
+	}{
+		{"empty key allows any", "", "whatever", true},
+		{"correct key", "sk-abc123", "sk-abc123", true},
+		{"wrong key", "sk-abc123", "sk-wrong", false},
+		{"missing header", "sk-abc123", "", false},
+		{"key is prefix of provided", "sk-abc", "sk-abcdef", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := VerifyAPIKey(reqAPIKey(c.hdr), c.key); got != c.want {
+				t.Errorf("VerifyAPIKey(key=%q, x-api-key=%q) = %v, want %v", c.key, c.hdr, got, c.want)
+			}
+		})
+	}
+}
+
+// TestVerifyBearerOrAPIKey 覆盖 /v1/messages 的双头鉴权：Bearer 或 x-api-key
+// 任一命中即放行，两者皆缺/皆错则拒绝。
+func TestVerifyBearerOrAPIKey(t *testing.T) {
+	cases := []struct {
+		name   string
+		key    string
+		authz  string
+		apiKey string
+		want   bool
+	}{
+		{"empty key allows all", "", "", "", true},
+		{"bearer accepted", "k", "Bearer k", "", true},
+		{"api key accepted", "k", "", "k", true},
+		{"both accepted", "k", "Bearer k", "k", true},
+		{"neither header", "k", "", "", false},
+		{"wrong bearer, right api key", "k", "Bearer x", "k", true},
+		{"right bearer, wrong api key", "k", "Bearer k", "x", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := req(c.authz)
+			if c.apiKey != "" {
+				r.Header.Set("x-api-key", c.apiKey)
+			}
+			if got := VerifyBearerOrAPIKey(r, c.key); got != c.want {
+				t.Errorf("VerifyBearerOrAPIKey(key=%q, authz=%q, x-api-key=%q) = %v, want %v",
+					c.key, c.authz, c.apiKey, got, c.want)
+			}
+		})
+	}
+}

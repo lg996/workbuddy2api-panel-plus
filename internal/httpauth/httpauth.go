@@ -15,6 +15,13 @@ import (
 // bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
 const bearerPrefix = "Bearer "
 
+// apiKeyHeader Anthropic 原生 SDK / Claude Code 使用的密钥头。
+//
+// 为什么单独支持它：OpenAI 生态统一走 `Authorization: Bearer`，而 Anthropic
+// SDK 默认发 `x-api-key`。网关两个入口共用同一把 api_key，这里把「读哪个头」
+// 收敛成一处，server 侧 `/v1/messages` 与 `/v1/chat/completions` 才能共享鉴权口径。
+const apiKeyHeader = "x-api-key"
+
 // VerifyBearer 校验请求头是否携带正确的 Bearer 密钥。
 //
 // key 为空表示"未启用鉴权"，恒返回 true（调用方据此放行）。
@@ -34,6 +41,28 @@ func VerifyBearer(r *http.Request, key string) bool {
 	}
 	tok := authz[len(bearerPrefix):]
 	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
+}
+
+// VerifyAPIKey 校验 Anthropic 风格的 `x-api-key` 头（常量时间比较，口径同
+// VerifyBearer）。key 为空表示未启用鉴权，恒返回 true。
+func VerifyAPIKey(r *http.Request, key string) bool {
+	if key == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare(digest(r.Header.Get(apiKeyHeader)), digest(key)) == 1
+}
+
+// VerifyBearerOrAPIKey 接受 `Authorization: Bearer <key>` 或 `x-api-key: <key>`
+// 任一形态。`/v1/messages` 用本函数：Anthropic SDK 发 x-api-key，但很多用户把
+// 网关当 OpenAI 兼容端点、复用同一把 key 时也会发 Bearer，两种都放行。
+//
+// 两个头都缺失时：VerifyBearer 已做一次常量时间比较（保持耗时形状），
+// 这里再比一次 x-api-key（空串），行为与单头校验一致。
+func VerifyBearerOrAPIKey(r *http.Request, key string) bool {
+	if key == "" {
+		return true
+	}
+	return VerifyBearer(r, key) || VerifyAPIKey(r, key)
 }
 
 // digest 返回 s 的 SHA-256（定长 32 字节，供常量时间比较）。

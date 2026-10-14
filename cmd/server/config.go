@@ -167,6 +167,27 @@ type Config struct {
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
 
+	// Anthropic 原生 Messages 端点（/v1/messages）的模型映射配置。
+	// 客户端发来的 claude-* 模型名无法直接当网关模型用，需在此显式映射。
+	Anthropic struct {
+		// DefaultModel claude-* 未命中 ModelMap 时的兜底出站模型名（可带 cn:/global: 前缀）；
+		// 空 = 不隐式映射，claude-* 直接报 400 提示配置。
+		DefaultModel string `json:"default_model"`
+		// ModelMap 显式映射：客户端模型名 → 网关模型名（值可带 realm 前缀），命中优先于 DefaultModel。
+		ModelMap map[string]string `json:"model_map"`
+	} `json:"anthropic"`
+
+	// Codex 原生 Responses API 端点（/v1/responses）的模型映射配置。
+	// Codex 客户端默认模型名未必存在于网关模型目录，可用 ModelMap 显式映射；
+	// 未命中且 DefaultModel 为空时原样透传（与 Anthropic 的强制映射策略不同）。
+	Codex struct {
+		// DefaultModel 未命中 ModelMap 时的兜底出站模型名（可带 cn:/global: 前缀）；
+		// 空 = 原样透传客户端模型名。
+		DefaultModel string `json:"default_model"`
+		// ModelMap 显式映射：客户端模型名 → 网关模型名（值可带 realm 前缀），命中优先于 DefaultModel。
+		ModelMap map[string]string `json:"model_map"`
+	} `json:"codex"`
+
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379

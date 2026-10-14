@@ -74,6 +74,22 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// AnthropicDefaultModel Anthropic Messages 端点（/v1/messages）的模型映射兜底：
+	// 客户端发 claude-* 且未命中 AnthropicModelMap 时，出站改写为该模型名。
+	// 空 = 不做隐式映射（claude-* 直接报错并提示配置），避免把请求悄悄打到错误模型。
+	AnthropicDefaultModel string
+	// AnthropicModelMap 显式模型映射（Anthropic 客户端模型名 → 网关模型名，
+	// 值可带 cn:/global: realm 前缀）。命中优先于 AnthropicDefaultModel。
+	AnthropicModelMap map[string]string
+
+	// CodexDefaultModel Responses API（Codex，/v1/responses）的模型映射兜底：
+	// 客户端模型名未命中 CodexModelMap 时，出站改写为该模型名。
+	// 空 = 原样透传（网关模型目录本身包含 gpt-* 模型，不能按前缀猜映射）。
+	CodexDefaultModel string
+	// CodexModelMap Responses API 显式模型映射（Codex 客户端模型名 → 网关模型名，
+	// 值可带 cn:/global: realm 前缀）。命中优先于 CodexDefaultModel。
+	CodexModelMap map[string]string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -136,6 +152,13 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Anthropic Messages 原生端点（Claude Code / Anthropic SDK）：协议翻译层，
+	// 复用 chatCompletions 的选号/轮转/冷却/统计管线，鉴权接受 Bearer 或 x-api-key。
+	h.mux.HandleFunc("POST /v1/messages", h.withAuthAnthropic(h.anthropicMessages))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuthAnthropic(h.anthropicCountTokens))
+	// OpenAI Responses API（Codex）原生端点：协议翻译层，复用 chatCompletions
+	// 的选号/轮转/冷却/统计管线；Codex 使用 Authorization: Bearer。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -146,8 +169,8 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && isChatPath(r.URL.Path) {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
@@ -168,10 +191,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// isChatPath 报告该路径是否走 chat 请求归档（OpenAI chat、Responses 与
+// Anthropic messages）。这些端点复用同一 requestTrace 出口记账，路径按真实路由落账。
+func isChatPath(p string) bool {
+	switch p {
+	case "/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens":
+		return true
+	}
+	return false
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// withAuthAnthropic 是 /v1/messages 的鉴权包装：接受 `Authorization: Bearer`
+// 或 `x-api-key`（Anthropic SDK 默认头），失败按 Anthropic 错误信封返回。
+func (h *Handler) withAuthAnthropic(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !httpauth.VerifyBearerOrAPIKey(r, h.loadLive().APIKey) {
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
 			return
 		}
 		next(w, r)
