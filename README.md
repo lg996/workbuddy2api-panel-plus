@@ -168,6 +168,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
+| **原生 Anthropic Messages 端点** | 新增 `POST /v1/messages` 与 `POST /v1/messages/count_tokens`：Claude Code / Anthropic SDK 可直接接入。**协议翻译层**——请求翻译成既有 OpenAI chat 请求，复用同一条选号 / 轮转 / 冷却 / 熔断 / 会话粘性 / 在途租约 / 统计 / 成本记账管线，响应再翻译回 Anthropic 协议；流式与非流式均覆盖，双头鉴权（`Authorization: Bearer` 或 `x-api-key`）。详见 [`REVIEW_ANTHROPIC_MESSAGES.md`](REVIEW_ANTHROPIC_MESSAGES.md) |
+| **原生 OpenAI Responses API 端点** | 新增 `POST /v1/responses`：Codex CLI / Responses SDK 可直接接入。同样为**协议翻译层**，复用 chat 全链路；`instructions` / `input`（字符串或 item 数组）/ 扁平 `tools` / `function_call(_output)` 双向翻译，流式按官方事件序列（`response.created` → … → `response.completed`，`sequence_number` 从 0）输出，`[DONE]` 不外泄。详见 [`REVIEW_CODEX_RESPONSES.md`](REVIEW_CODEX_RESPONSES.md) |
 
 ### 同步上游
 
