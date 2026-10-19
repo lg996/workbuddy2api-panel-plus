@@ -27,7 +27,7 @@ import (
 // 「协议形态」，不碰「调度决策」。
 
 // anthropicRequest 是 Anthropic Messages 请求体中网关需要理解的最小子集。
-// 未列出的字段（thinking / metadata / service_tier 等）直接忽略。
+// 未列出的字段（metadata / service_tier 等）直接忽略。
 type anthropicRequest struct {
 	Model         string             `json:"model"`
 	System        json.RawMessage    `json:"system"`
@@ -40,6 +40,14 @@ type anthropicRequest struct {
 	Stream        bool               `json:"stream"`
 	Tools         []anthropicTool    `json:"tools"`
 	ToolChoice    json.RawMessage    `json:"tool_choice"`
+	Thinking      *anthropicThinking `json:"thinking"`
+}
+
+// anthropicThinking 表示扩展思考开关、预算与显式档位。
+type anthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
+	Effort       string `json:"effort,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -183,7 +191,60 @@ func anthropicToOpenAI(req *anthropicRequest, model string) ([]byte, error) {
 	if tc := anthropicToolChoice(req.ToolChoice); tc != nil {
 		out["tool_choice"] = tc
 	}
+	applyAnthropicThinking(out, model, req.Thinking)
 	return json.Marshal(out)
+}
+
+// applyAnthropicThinking 把 Anthropic 的思考配置翻译成 Chat 的 reasoning_effort。
+// 禁用思考在 DeepSeek 上需要显式 thinking.type=disabled；其他上游没有通用的
+// “关闭思考”字段，因此不注入 off，避免被档位降级逻辑误认为最低档。
+func applyAnthropicThinking(out map[string]any, model string, thinking *anthropicThinking) {
+	if thinking == nil {
+		return
+	}
+	typ := strings.ToLower(strings.TrimSpace(thinking.Type))
+	switch typ {
+	case "disabled":
+		if isDeepSeekLikeModel(model) {
+			out["thinking"] = map[string]any{"type": "disabled"}
+			delete(out, "reasoning_effort")
+			delete(out, "reasoningEffort")
+		}
+		return
+	case "enabled", "adaptive":
+	default:
+		return
+	}
+	effort := strings.TrimSpace(thinking.Effort)
+	if effort == "" {
+		effort = anthropicBudgetToEffort(thinking.BudgetTokens)
+	}
+	out["reasoning_effort"] = effort
+}
+
+// anthropicBudgetToEffort 按预算区间选择档位。Anthropic 的 budget_tokens
+// 与产品 effort 没有官方一一对应，这里采用单调区间，再由上游支持表降级。
+func anthropicBudgetToEffort(budget int) string {
+	switch {
+	case budget <= 0:
+		return "high"
+	case budget < 4096:
+		return "low"
+	case budget < 8192:
+		return "medium"
+	case budget < 16384:
+		return "high"
+	case budget < 32000:
+		return "xhigh"
+	default:
+		return "max"
+	}
+}
+
+// isDeepSeekLikeModel 剥掉 cn:/global: 路由前缀后判断上游是否 DeepSeek 系。
+func isDeepSeekLikeModel(model string) bool {
+	_, bare := resolveModel(model)
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(bare)), "deepseek")
 }
 
 // anthropicSystemText 把 system 字段（字符串或 text block 数组）拍平成一段文本。

@@ -1,8 +1,12 @@
-# Review：新增原生 Anthropic Messages 端点（`/v1/messages`）
+# Review：原生 Anthropic Messages 端点与思考档位适配
 
-本次改动为网关补上**原生 Anthropic Messages** 协议入口（Claude Code / Anthropic SDK
-可直接对接），OpenAI Chat Completions 既有行为零改动。Responses API（Codex）另见
-`REVIEW_CODEX_RESPONSES.md`。
+本文记录两阶段工作：先为网关补上**原生 Anthropic Messages** 协议入口（Claude Code /
+Anthropic SDK 可直接对接），随后把 Anthropic `thinking` 配置接入既有 Chat
+`reasoning_effort` 档位体系。OpenAI Chat Completions 既有行为不变；Responses API
+（Codex）见 `REVIEW_CODEX_RESPONSES.md`。
+
+> 阅读提示：第 2、3 节中的 `/v1/messages`、鉴权与响应翻译属于**已落库的基线实现**；
+> 标题含「本次增量」的部分才是当前工作区相对基线新增的 `thinking` 适配。
 
 ---
 
@@ -28,18 +32,20 @@
 
 ---
 
-## 2. 新增文件
+## 2. 实现文件
 
 ### `internal/server/anthropic.go`（约 1030 行）
 
 协议适配层全部实现，分四块：
 
-1. **请求类型**：`anthropicRequest` / `anthropicMessage` / `anthropicTool`——只声明
-   网关需要理解的字段子集，未列出字段（`thinking` / `metadata` / `service_tier` 等）
-   直接忽略。
+1. **请求类型**：`anthropicRequest` / `anthropicThinking` / `anthropicMessage` /
+   `anthropicTool`——只声明网关需要理解的字段子集，未列出字段（`metadata` /
+   `service_tier` 等）直接忽略。`anthropicThinking` 及 `reasoning_effort` 翻译属于
+   本次增量，其余请求类型属于基线实现。
 2. **请求翻译**：`anthropicToOpenAI` 及一组 helper（`anthropicSystemText`、
    `anthropicMessageToOpenAI`、`userBlocksToOpenAI`、`assistantBlocksToOpenAI`、
-   `anthropicImageURL`、`anthropicToolResultText`、`anthropicToolChoice`）。
+   `anthropicImageURL`、`anthropicToolResultText`、`anthropicToolChoice`、
+   `applyAnthropicThinking`、`anthropicBudgetToEffort`）。
 3. **响应翻译**：
    - `anthropicBridge`：包在 `chatCompletions` 与客户端之间的 `http.ResponseWriter`，
      把网关写出的 OpenAI 字节（非流式 JSON / SSE）翻译成 Anthropic 协议；
@@ -55,12 +61,34 @@
 
 ### `internal/server/anthropic_test.go`
 
-新增 7 个测试（含子用例），覆盖：双头鉴权、非流式文本往返、工具调用双向翻译、流式事件
-序列、模型映射四态、上游错误透传、`count_tokens` 不打上游。
+共 10 个测试（含子用例）：基线 7 个覆盖双头鉴权、非流式文本往返、工具调用双向翻译、
+流式事件序列、模型映射四态、上游错误透传、`count_tokens` 不打上游；本次增量新增 3 个，
+覆盖 `thinking` 预算分档 / 显式档位 / 关闭思考、关闭意图穿过上游注入管线，以及
+`budget_tokens=32000 → max` 经完整请求链路按 global 模型能力降级为 `high`。
 
 ---
 
-## 3. 修改文件（逐文件说明改了什么、为什么）
+## 3. 文件清单（区分基线实现与本次增量）
+
+下表先给出**本次工作区改动**；随后各小节保留 Anthropic 端点的完整基线说明，便于后
+续维护。基线文件不是本次重新实现的，Review 中不再把它们描述成本次新增。
+
+| 文件 | 本次增量 |
+|---|---|
+| `internal/server/anthropic.go` | 新增 `anthropicThinking`；在请求翻译末尾调用 `applyAnthropicThinking`；新增预算区间映射 `anthropicBudgetToEffort`、DeepSeek 识别 `isDeepSeekLikeModel`，处理 `enabled` / `adaptive` / `disabled` 与显式 `effort` |
+| `internal/server/anthropic_test.go` | 新增 `TestAnthropicThinkingToReasoningEffort`、`TestAnthropicThinkingDisabledReachesUpstream`、`TestAnthropicThinkingEffortDowngradedOnUpstream` |
+| `README.md` | 特性表补充 Anthropic thinking → `reasoning_effort`；字段翻译表新增 thinking 行；已知边界更新为「档位映射已支持，thinking block 尚未回传」 |
+| `REVIEW_ANTHROPIC_MESSAGES.md` | 补充本次增量说明、预算分档、关闭语义、降级验证与限制，并区分基线实现与后续适配 |
+
+**本次没有改调度链路**：Anthropic 请求仍在 `anthropicToOpenAI` 后直接进入既有
+`chatCompletions`，账号选择、会话粘性、重试、冷却、统计等行为均复用原链路。档位最终
+由既有 `normalizeReasoningEffort` 按模型 `supportedEfforts` 降级，避免给不支持高档位的
+模型发送超范围值。
+
+### 基线文件总览
+
+以下文件是 Anthropic Messages 端点首次落地时引入或修改的，当前 Review 保留说明仅供
+理解全貌；它们不属于本次 `thinking` 档位增量的工作区 diff。
 
 ### `internal/httpauth/httpauth.go`
 
@@ -163,7 +191,27 @@
 | `stop_sequences` | `stop` |
 | `max_tokens` / `temperature` / `top_p` | 同名透传 |
 | `stream` | `stream` |
-| `top_k`、`thinking`、`metadata` 等 | 忽略 |
+| `top_k`、`metadata` 等 | 忽略 |
+
+**思考档位适配（2026-10 新增）**：`thinking` 不再被忽略，而是先映射为 Chat 的
+`reasoning_effort`，随后复用既有 `normalizeReasoningEffort` 按模型
+`supportedEfforts` 选择不超过请求档位的最高支持档。Anthropic 的
+`budget_tokens` 采用单调区间映射：
+
+| `budget_tokens` | `reasoning_effort` |
+|---|---|
+| `<= 0` / 缺失 | `high` |
+| `1–4095` | `low` |
+| `4096–8191` | `medium` |
+| `8192–16383` | `high` |
+| `16384–31999` | `xhigh` |
+| `>= 32000` | `max` |
+
+- `thinking.effort` 显式给出时优先于预算映射，不经过二次换算；
+- `thinking.type=adaptive` 无预算时默认 `high`；`enabled` 无预算同样默认 `high`；
+- `thinking.type=disabled`：DeepSeek 系发送 `thinking.type=disabled` 且删除 effort，
+  防止既有注入逻辑重新开启思考；其他模型不注入关闭字段，避免上游不识别；
+- `thinking` 缺失、type 为空或未知时保持旧行为，不注入 `reasoning_effort`。
 
 > 说明：网关出站前会走既有 `upstream.PrepareBodyOpt`，其中 `tool_choice` 对象会被归一化
 > 成上游认的字符串形式（`{type:function,function:{name:X}}` → `"X"`）。这是既有行为，
@@ -268,11 +316,15 @@ Anthropic SDK 只需把 `base_url` 指向 `http://localhost:7863`（SDK 会自�
 
 ## 6. 验证
 
-- `go build ./internal/server ./internal/httpauth ./cmd/server` 通过；
-- `go test ./internal/httpauth ./internal/server` 通过；
-- `go test ./...` 全绿（含新增 `anthropic_test.go` 7 个测试）。
+- `gofmt -w internal/server/anthropic.go internal/server/anthropic_test.go` 已执行；
+- `go build ./...` 通过（2026-10-19）；
+- `go test ./internal/server -run TestAnthropicThinking -count=1 -v` 通过（0.704s），
+  日志确认 `reasoning_effort downgraded model=deepseek-v4.1-flash max -> high`；
+- `go test ./internal/server -count=1` 通过（8.493s）；
+- `go test ./... -count=1` 全部包通过（2026-10-19；`internal/server` 9.562s），
+  含 `anthropic_test.go` 共 10 个测试。
 
-新增测试覆盖：
+`anthropic_test.go` 测试覆盖：
 
 | 测试 | 覆盖点 |
 |---|---|
@@ -281,6 +333,9 @@ Anthropic SDK 只需把 `base_url` 指向 `http://localhost:7863`（SDK 会自�
 | `TestAnthropicMessagesToolUse` | tools / tool_choice 翻译；tool_calls → tool_use + `stop_reason=tool_use` |
 | `TestAnthropicMessagesStream` | 流式事件序列与顺序、`[DONE]` 不外泄 |
 | `TestAnthropicModelMapping` | 显式映射（含 realm 前缀剥离）/ default 兜底 / 非 claude 透传 / 未映射 400 且不打上游 |
+| `TestAnthropicThinkingToReasoningEffort` | 预算边界 `1/4095/4096/8191/8192/16383/16384/31999/32000`、缺预算、`adaptive`、显式 effort 优先、未知 type 忽略、DeepSeek / 非 DeepSeek 的 disabled 处理 |
+| `TestAnthropicThinkingDisabledReachesUpstream` | DeepSeek 的 `thinking.type=disabled` 穿过既有注入管线且不带 effort；GLM 不凭空获得 thinking 对象 |
+| `TestAnthropicThinkingEffortDowngradedOnUpstream` | `global:deepseek-v4.1-flash` + `budget_tokens=32000` 经 Anthropic → Chat → upstream 全链路，`max` 按模型能力降级为 `high`，且出站模型名已剥掉 realm 前缀 |
 | `TestAnthropicMessagesUpstreamError` | 上游 429 → Anthropic `rate_limit_error` |
 | `TestAnthropicCountTokens` | 本地估算返回正整数且不调用上游 |
 
@@ -290,8 +345,12 @@ Anthropic SDK 只需把 `base_url` 指向 `http://localhost:7863`（SDK 会自�
 
 - `count_tokens` 为**本地粗估**（按字符数 / 4），不请求上游；Claude Code 用它做上下文
   预算，精确值非必需。
-- `top_k`、`thinking`（扩展思考块）、`metadata`、`service_tier` 等字段被忽略；
-  `thinking` 内容不会以 Anthropic thinking block 形式回传。
+- `top_k`、`metadata`、`service_tier` 等字段仍被忽略。`thinking` 的
+  `type` / `budget_tokens` / `effort` 已映射到 Chat 的 `reasoning_effort`，
+  最终档位按模型 `supportedEfforts` 降级；但上游 `reasoning_content` 仍**不会**
+  以 Anthropic `thinking` content block 形式回传。
+- `thinking.budget_tokens` 到档位是网关定义的区间映射，不是 Anthropic 官方
+  一一对应；不同上游的实际推理强度仍受模型能力表约束。
 - 流式 `message_start` 的 `input_tokens` 固定为 0（上游 usage 通常只在末帧给出），
   `output_tokens` 在 `message_delta` 补齐。
 - `claude-*` 模型名必须显式配置映射，否则 400（设计选择，见 4.5）。

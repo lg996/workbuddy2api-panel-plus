@@ -63,7 +63,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
 | ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
-| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
+| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、Anthropic `thinking.budget_tokens` / `effort` → Chat `reasoning_effort`、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
@@ -757,6 +757,7 @@ http://127.0.0.1:7863/panel/
 | 请求 | `tools[].input_schema` | `tools[].function.parameters` |
 | 请求 | `tool_choice`：`auto`/`any`/`none`/`{type:tool,name}` | `auto`/`required`/`none`/指定函数 |
 | 请求 | `stop_sequences` / `max_tokens` / `temperature` / `top_p` | `stop` / `max_tokens` / `temperature` / `top_p` |
+| 请求 | `thinking.type=enabled/adaptive` + `budget_tokens` | `reasoning_effort`（按预算区间映射，显式 `thinking.effort` 优先） |
 | 响应 | `content[].text` | `choices[0].message.content` |
 | 响应 | `content[].tool_use`（`input` 为对象） | `choices[0].message.tool_calls`（`arguments` JSON 解析回对象） |
 | 响应 | `stop_reason`：`end_turn`/`max_tokens`/`tool_use` | `finish_reason`：`stop`/`length`/`tool_calls` |
@@ -767,7 +768,7 @@ http://127.0.0.1:7863/panel/
 已知边界：
 
 - `count_tokens` 为**本地粗估**（按字符数 / 4），不请求上游；Claude Code 用它做上下文预算，精确值非必需。
-- `top_k`、`thinking`（扩展思考块）、`metadata` 等字段被忽略；`thinking` 内容不会以 Anthropic thinking block 形式回传。
+- `top_k`、`metadata` 等字段被忽略。`thinking` 的 `type` / `budget_tokens` / `effort` 会映射为 `reasoning_effort`，再按模型能力降级；`thinking.type=disabled` 对 DeepSeek 显式透传为关闭。上游 `reasoning_content` 暂不会以 Anthropic thinking block 形式回传。
 - 流式 `message_start` 的 `input_tokens` 固定为 0（上游 usage 通常只在末帧给出），`output_tokens` 在 `message_delta` 补齐。
 - 上游错误按状态码映射到 Anthropic `error.type`（401 `authentication_error` / 403 `permission_error` / 429 `rate_limit_error` / 400 `invalid_request_error` / 503/502 `overloaded_error` / 其余 `api_error`）。
 

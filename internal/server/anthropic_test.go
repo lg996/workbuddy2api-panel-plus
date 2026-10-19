@@ -374,6 +374,135 @@ func TestAnthropicModelMapping(t *testing.T) {
 	}
 }
 
+// TestAnthropicThinkingToReasoningEffort 覆盖 Anthropic thinking 到 Chat
+// reasoning_effort 的预算分档、显式 effort 优先级，以及关闭思考的保守处理。
+func TestAnthropicThinkingToReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name         string
+		model        string
+		thinking     *anthropicThinking
+		wantEffort   string
+		wantThinking string
+	}{
+		{name: "missing thinking"},
+		{name: "enabled 1024", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 1024}, wantEffort: "low"},
+		{name: "enabled 4095", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 4095}, wantEffort: "low"},
+		{name: "enabled 4096", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 4096}, wantEffort: "medium"},
+		{name: "enabled 8191", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 8191}, wantEffort: "medium"},
+		{name: "enabled 8192", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 8192}, wantEffort: "high"},
+		{name: "enabled 16383", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 16383}, wantEffort: "high"},
+		{name: "enabled 16384", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 16384}, wantEffort: "xhigh"},
+		{name: "enabled 31999", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 31999}, wantEffort: "xhigh"},
+		{name: "enabled 32000", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 32000}, wantEffort: "max"},
+		{name: "enabled without budget", thinking: &anthropicThinking{Type: "enabled"}, wantEffort: "high"},
+		{name: "adaptive without budget", thinking: &anthropicThinking{Type: "adaptive"}, wantEffort: "high"},
+		{name: "explicit effort wins", thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 1024, Effort: "max"}, wantEffort: "max"},
+		{name: "unknown type ignored", thinking: &anthropicThinking{Type: "something-else", BudgetTokens: 32000}},
+		{name: "non-deepseek disabled ignored", model: "glm-5.2", thinking: &anthropicThinking{Type: "disabled"}},
+		{name: "deepseek disabled explicit", model: "global:deepseek-v4", thinking: &anthropicThinking{Type: "disabled"}, wantThinking: "disabled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			model := tc.model
+			if model == "" {
+				model = "glm-5.2"
+			}
+			req := &anthropicRequest{
+				Model:    model,
+				Thinking: tc.thinking,
+				Messages: []anthropicMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+			}
+			raw, err := anthropicToOpenAI(req, model)
+			if err != nil {
+				t.Fatalf("anthropicToOpenAI: %v", err)
+			}
+			var out map[string]any
+			if err := json.Unmarshal(raw, &out); err != nil {
+				t.Fatalf("outbound body not json: %v (%s)", err, raw)
+			}
+			if got, _ := out["reasoning_effort"].(string); got != tc.wantEffort {
+				t.Errorf("reasoning_effort=%q want %q", got, tc.wantEffort)
+			}
+			thinking, _ := out["thinking"].(map[string]any)
+			gotThinking, _ := thinking["type"].(string)
+			if gotThinking != tc.wantThinking {
+				t.Errorf("thinking.type=%q want %q", gotThinking, tc.wantThinking)
+			}
+		})
+	}
+}
+
+// TestAnthropicThinkingDisabledReachesUpstream 验证 DeepSeek 的关闭意图能穿过
+// 既有 thinking 注入管线；非 DeepSeek 则不应凭空收到 thinking 对象。
+func TestAnthropicThinkingDisabledReachesUpstream(t *testing.T) {
+	cases := []struct {
+		name         string
+		model        string
+		wantThinking string
+	}{
+		{name: "deepseek", model: "deepseek-v4", wantThinking: "disabled"},
+		{name: "glm", model: "glm-5.2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeChatUpstream(anthropicSSEText)
+			h := anthropicHandler(Config{}, fake.client)
+			body := `{"model":"` + tc.model + `","max_tokens":16,` +
+				`"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}`
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			var out map[string]any
+			if err := json.Unmarshal(fake.last(), &out); err != nil {
+				t.Fatalf("outbound body not json: %v (%s)", err, fake.last())
+			}
+			thinking, _ := out["thinking"].(map[string]any)
+			gotThinking, _ := thinking["type"].(string)
+			if gotThinking != tc.wantThinking {
+				t.Errorf("thinking.type=%q want %q", gotThinking, tc.wantThinking)
+			}
+			if _, ok := out["reasoning_effort"]; ok {
+				t.Errorf("disabled request must not carry reasoning_effort: %s", fake.last())
+			}
+		})
+	}
+}
+
+// TestAnthropicThinkingEffortDowngradedOnUpstream 验证预算映射出的高档位会经过
+// chatCompletions 与 upstream.prepareBody 全链路，按 global 模型能力降级后再出站。
+// global:deepseek-v4.1-flash 静态能力只有 high；预算 32000 先映射为 max。
+func TestAnthropicThinkingEffortDowngradedOnUpstream(t *testing.T) {
+	fake := newFakeChatUpstream(anthropicSSEText)
+	fake.client.GlobalEnabled = true
+	p := testPoolWith(&auth.Auth{
+		UID:         "global1",
+		AccessToken: "at1",
+		ExpiresAt:   9999999999,
+		Domain:      "www.workbuddy.ai",
+	})
+	h := NewHandler(Config{Pool: p, Upstream: fake.client, GlobalEnabled: true})
+	body := `{"model":"global:deepseek-v4.1-flash","max_tokens":16,` +
+		`"thinking":{"type":"enabled","budget_tokens":32000},` +
+		`"messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(fake.last(), &out); err != nil {
+		t.Fatalf("outbound body not json: %v (%s)", err, fake.last())
+	}
+	if out["model"] != "deepseek-v4.1-flash" {
+		t.Errorf("outbound model=%v want bare global model", out["model"])
+	}
+	if got, _ := out["reasoning_effort"].(string); got != "high" {
+		t.Errorf("reasoning_effort=%q want high after downgrade (outbound=%s)", got, fake.last())
+	}
+}
+
 // TestAnthropicMessagesUpstreamError 覆盖上游错误透传：状态码保留、错误信封
 // 翻译成 Anthropic error.type（429 → rate_limit_error）。
 func TestAnthropicMessagesUpstreamError(t *testing.T) {
